@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  PROGRAM_NAME: qnd
+  PROGRAM_NAME: dqn
 
 jobs:
   build:

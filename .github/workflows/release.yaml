@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  PROGRAM_NAME: qnd
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+
+          - os: ubuntu-latest
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            suffix: ""
+
+          - os: windows-latest
+            arch: amd64
+            target: x86_64-pc-windows-msvc
+            suffix: ".exe"
+
+          - os: windows-latest
+            arch: arm64
+            target: aarch64-pc-windows-msvc
+            suffix: ".exe"
+
+          - os: macos-latest
+            arch: amd64
+            target: x86_64-apple-darwin
+            suffix: ""
+
+          - os: macos-latest
+            arch: arm64
+            target: aarch64-apple-darwin
+            suffix: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # 拉取仓库代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 查看 GitHub Runner 内置的 Rust 版本
+      - name: Show Rust version
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          rustup --version
+
+      # 给当前 Rust toolchain 添加目标平台
+      - name: Add Rust target
+        shell: bash
+        run: |
+          rustup target add ${{ matrix.target }}
+
+      # Linux ARM64 交叉编译需要 ARM64 GCC linker
+      - name: Install Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      # 为 Linux ARM64 指定 linker
+      - name: Configure Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          mkdir -p .cargo
+
+          cat > .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      # 编译
+      - name: Build
+        shell: bash
+        run: |
+          echo "OS: $RUNNER_OS"
+          echo "Arch: ${{ matrix.arch }}"
+          echo "Target: ${{ matrix.target }}"
+
+          cargo build \
+            --release \
+            --locked \
+            --target ${{ matrix.target }}
+
+      # 将最终二进制复制到 dist
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          cp \
+            "target/${{ matrix.target }}/release/${PROGRAM_NAME}${{ matrix.suffix }}" \
+            "dist/${PROGRAM_NAME}-${{ matrix.target }}${{ matrix.suffix }}"
+
+          ls -lah dist
+
+      # 上传当前平台的构建结果
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROGRAM_NAME }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs:
+      - build
+
+    runs-on: ubuntu-latest
+
+    steps:
+      # 下载上面 6 个 build job 产生的 artifact
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 检查下载的文件
+      - name: Show artifacts
+        run: |
+          ls -lah dist
+
+      # 创建 GitHub Release
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/* \
+            --verify-tag \
+            --generate-notes

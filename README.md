@@ -30,10 +30,10 @@ cargo build --release
 | `Insert` | 选择/取消当前歌曲 |
 | `Ctrl+A` | 选择/取消当前页全部歌曲 |
 | `Left` / `Right` | 上一页/下一页 |
-| `Ctrl+P` 或 `Tab` | 切换网易云音乐 / QQ 音乐 |
-| `Ctrl+T` 或 `Ctrl+X` | 切换下载音质 |
+| `Ctrl+P` 或 `Tab` | 切换 |
+| `Ctrl+T` 或 `Ctrl+X` | 切换音质 |
 | `Ctrl+D` | 下载已选歌曲;未多选时下载当前行 |
-| `Ctrl+L` | 当前平台扫码登录 |
+| `Ctrl+L` | 扫码登录 |
 | `F8` | 清理完成/失败的下载记录 |
 | `F1` 或 `Ctrl+H` | 显示/隐藏帮助 |
 | `Ctrl+Q` | 无活动下载时安全退出 |

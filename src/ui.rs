@@ -28,22 +28,31 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     }
 
     let cookie_warning_count = app.cookie_warnings().len() as u16;
+    // Reserve the footer before dividing the remaining space, so short terminals
+    // cannot shrink persistent login warnings down to an empty border.
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(4 + cookie_warning_count),
+        ])
+        .split(area);
+    let download_height = sections[0].height.saturating_sub(9).min(7);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(7),
-            Constraint::Length(7),
-            Constraint::Length(4 + cookie_warning_count),
+            Constraint::Min(3),
+            Constraint::Length(download_height),
         ])
-        .split(area);
+        .split(sections[0]);
 
     draw_header(frame, app, chunks[0]);
     draw_search(frame, app, chunks[1]);
     draw_results(frame, app, chunks[2]);
     draw_downloads(frame, app, chunks[3]);
-    draw_footer(frame, app, chunks[4]);
+    draw_footer(frame, app, sections[1]);
 
     if app.show_help {
         draw_help(frame, area);
@@ -581,9 +590,15 @@ mod tests {
         )));
         for (width, height) in [(58, 18), (58, 24), (80, 24)] {
             let screen = render_text(&app, width, height);
-            assert_eq!(screen.matches("Cookie 已过期").count(), 2);
+            assert_eq!(
+                screen.matches("Cookie 已过期").count(),
+                2,
+                "{width}x{height}:\n{screen}",
+            );
             assert!(screen.contains("Ctrl+P"));
             assert_eq!(screen.matches("Ctrl+L").count(), 2);
+            assert!(screen.contains("音乐下载器"));
+            assert!(screen.contains("搜索("));
         }
     }
 

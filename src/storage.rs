@@ -171,6 +171,11 @@ impl CookieStore {
             Some(_) => "已登录",
         }
     }
+
+    pub fn is_expired(&self, platform: Platform) -> bool {
+        self.stored_token_for(platform)
+            .is_some_and(|token| token_is_expired_at(&token, unix_now()))
+    }
 }
 
 fn unix_now() -> i64 {

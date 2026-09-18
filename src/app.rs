@@ -147,6 +147,7 @@ pub struct App {
     login_request_id: u64,
     login_cancel: Option<oneshot::Sender<()>>,
     cookie_refresh_pending: usize,
+    cookie_refresh_failed: Vec<Platform>,
 }
 
 impl App {
@@ -201,6 +202,7 @@ impl App {
             login_request_id: 0,
             login_cancel: None,
             cookie_refresh_pending: 0,
+            cookie_refresh_failed: Vec::new(),
         }
     }
 
@@ -267,6 +269,43 @@ impl App {
             kind,
             changed_at: Instant::now(),
         };
+    }
+
+    pub fn login_state(&self, platform: Platform) -> &'static str {
+        if self.cookies.is_expired(platform) {
+            "登录已过期"
+        } else if self.cookie_refresh_failed.contains(&platform) {
+            "登录待确认"
+        } else {
+            self.cookies.login_state(platform)
+        }
+    }
+
+    /// 登录问题独立于瞬时操作提示,直到刷新或重新登录成功才消失.
+    /// 每次绘制都检查本地有效期,覆盖程序运行期间 Cookie 到期的情况.
+    pub fn cookie_warnings(&self) -> Vec<String> {
+        [Platform::Netease, Platform::Tencent]
+            .into_iter()
+            .filter_map(|platform| {
+                let problem = if self.cookies.is_expired(platform) {
+                    "Cookie 已过期"
+                } else if self.cookie_refresh_failed.contains(&platform) {
+                    "Cookie 刷新失败"
+                } else {
+                    return None;
+                };
+                let name = match platform {
+                    Platform::Netease => "网易云",
+                    Platform::Tencent => "QQ音乐",
+                };
+                let action = if platform == self.platform {
+                    "Ctrl+L 重新登录"
+                } else {
+                    "Ctrl+P 切换后 Ctrl+L 登录"
+                };
+                Some(format!("{name} {problem};{action}"))
+            })
+            .collect()
     }
 
     pub fn platform_label(platform: Platform) -> &'static str {
@@ -830,6 +869,8 @@ impl App {
                 };
                 // 登录成功后立即同步保存;后续请求均从该存储读取 Cookie.
                 let save_result = self.cookies.set_and_save(token, &self.paths.cookie_file);
+                self.cookie_refresh_failed
+                    .retain(|platform| *platform != logged_in_platform);
                 self.login_overlay = None;
                 self.login_cancel = None;
                 match save_result {
@@ -849,30 +890,39 @@ impl App {
             AppMessage::CookieRefreshFinished { platform, result } => {
                 self.cookie_refresh_pending = self.cookie_refresh_pending.saturating_sub(1);
                 match result {
-                    Ok(token) => match self.cookies.set_and_save(token, &self.paths.cookie_file) {
-                        Ok(()) => self.set_notice(
-                            NoticeKind::Success,
-                            format!(
-                                "{} Cookie 已自动更新并立即保存",
-                                Self::platform_label(platform)
+                    Ok(token) => {
+                        self.cookie_refresh_failed
+                            .retain(|failed| *failed != platform);
+                        match self.cookies.set_and_save(token, &self.paths.cookie_file) {
+                            Ok(()) => self.set_notice(
+                                NoticeKind::Success,
+                                format!(
+                                    "{} Cookie 已自动更新并立即保存",
+                                    Self::platform_label(platform)
+                                ),
                             ),
-                        ),
-                        Err(error) => self.set_notice(
+                            Err(error) => self.set_notice(
+                                NoticeKind::Warning,
+                                format!(
+                                    "{} Cookie 已更新,但写入 {} 失败:{error}",
+                                    Self::platform_label(platform),
+                                    self.paths.cookie_file.display()
+                                ),
+                            ),
+                        }
+                    }
+                    Err(error) => {
+                        if !self.cookie_refresh_failed.contains(&platform) {
+                            self.cookie_refresh_failed.push(platform);
+                        }
+                        self.set_notice(
                             NoticeKind::Warning,
                             format!(
-                                "{} Cookie 已更新,但写入 {} 失败:{error}",
-                                Self::platform_label(platform),
-                                self.paths.cookie_file.display()
+                                "{} Cookie 自动更新失败:{error};请按 Ctrl+L 重新登录",
+                                Self::platform_label(platform)
                             ),
-                        ),
-                    },
-                    Err(error) => self.set_notice(
-                        NoticeKind::Warning,
-                        format!(
-                            "{} Cookie 自动更新失败:{error};请按 Ctrl+L 重新登录",
-                            Self::platform_label(platform)
-                        ),
-                    ),
+                        );
+                    }
                 }
             }
             AppMessage::DownloadStage { job_id, state } => {

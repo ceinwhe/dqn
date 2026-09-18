@@ -27,6 +27,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
+    let cookie_warning_count = app.cookie_warnings().len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,7 +35,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
             Constraint::Length(3),
             Constraint::Min(7),
             Constraint::Length(7),
-            Constraint::Length(4),
+            Constraint::Length(4 + cookie_warning_count),
         ])
         .split(area);
 
@@ -50,11 +51,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let netease_login = app.cookies.login_state(Platform::Netease);
-    let tencent_login = app.cookies.login_state(Platform::Tencent);
+    let netease_login = app.login_state(Platform::Netease);
+    let tencent_login = app.login_state(Platform::Tencent);
     let login_style = |login| match login {
         "已登录" => Style::default().fg(SUCCESS),
-        "登录已过期" => Style::default().fg(WARNING),
+        "登录已过期" | "登录待确认" => Style::default().fg(WARNING),
         _ => Style::default().fg(MUTED),
     };
     let line = Line::from(vec![
@@ -278,8 +279,14 @@ fn draw_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("提示:", Style::default().fg(MUTED)),
         Span::styled(&app.notice.text, notice_style),
     ]);
+    let mut lines: Vec<Line<'_>> = app
+        .cookie_warnings()
+        .into_iter()
+        .map(|warning| Line::styled(warning, Style::default().fg(WARNING).bold()))
+        .collect();
+    lines.extend([shortcut, notice]);
     frame.render_widget(
-        Paragraph::new(vec![shortcut, notice]).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
         area,
     );
 }
@@ -480,6 +487,155 @@ mod tests {
 
     use crate::app::{LoginOverlay, LoginPhase};
     use crate::storage::AppPaths;
+
+    fn cookie_test_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        App::new(
+            Arc::new(MusicClient::new()),
+            tx,
+            AppPaths {
+                cookie_file: "__dqn_ui_test_cookie.json".into(),
+                download_dir: "test-downloads".into(),
+            },
+        )
+    }
+
+    fn render_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| {
+                let mut text = String::new();
+                let mut column = 0;
+                while column < row.len() {
+                    let symbol = row[column].symbol();
+                    text.push_str(symbol);
+                    column += Line::from(symbol).width().max(1);
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn set_test_cookie(app: &mut App, expires_at: i64) {
+        use netease_qq_music_api::models::{LoginToken, NeteaseLoginToken};
+        app.cookies.set(LoginToken::Netease(NeteaseLoginToken::new(
+            "test",
+            "test",
+            "test",
+            Some(expires_at),
+        )));
+    }
+
+    #[test]
+    fn expired_cookie_warning_survives_other_notices_and_redraws() {
+        let mut app = cookie_test_app();
+        set_test_cookie(&mut app, i64::MAX);
+        assert!(app.cookie_warnings().is_empty());
+
+        // The next redraw must detect expiry without a startup refresh or an API error.
+        set_test_cookie(&mut app, 1);
+        app.set_notice(NoticeKind::Success, "搜索成功");
+        app.notice.changed_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+        let screen = render_text(&app, 80, 24);
+        assert!(screen.contains("Cookie 已过期"));
+        assert!(screen.contains("Ctrl+L"));
+        assert!(screen.contains("搜索成功"));
+        assert!(app.cookies.token_for(Platform::Netease).is_none());
+    }
+
+    #[test]
+    fn refresh_failure_is_persistent_without_claiming_network_failure_is_expiry() {
+        let mut app = cookie_test_app();
+        set_test_cookie(&mut app, i64::MAX);
+        app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
+            platform: Platform::Netease,
+            result: Err("连接超时".to_owned()),
+        });
+        app.set_notice(NoticeKind::Success, "下载完成");
+        assert_eq!(app.login_state(Platform::Netease), "登录待确认");
+        assert!(app.cookies.token_for(Platform::Netease).is_some());
+        let screen = render_text(&app, 80, 24);
+        assert!(screen.contains("Cookie 刷新失败"));
+        assert!(!screen.contains("Cookie 已过期"));
+    }
+
+    #[test]
+    fn both_platform_warnings_fit_and_explain_how_to_switch_platform() {
+        use netease_qq_music_api::models::{LoginToken, TencentLoginToken};
+        let mut app = cookie_test_app();
+        set_test_cookie(&mut app, 1);
+        app.cookies.set(LoginToken::Tencent(TencentLoginToken::new(
+            1,
+            "test",
+            "test",
+            "test",
+            Some(1),
+            1,
+        )));
+        for (width, height) in [(58, 18), (58, 24), (80, 24)] {
+            let screen = render_text(&app, width, height);
+            assert_eq!(screen.matches("Cookie 已过期").count(), 2);
+            assert!(screen.contains("Ctrl+P"));
+            assert_eq!(screen.matches("Ctrl+L").count(), 2);
+        }
+    }
+
+    #[test]
+    fn successful_refresh_clears_only_its_platform_warning() {
+        use netease_qq_music_api::models::{LoginToken, NeteaseLoginToken};
+        let mut app = cookie_test_app();
+        // A directory makes saving fail without creating any credentials on disk.
+        app.paths.cookie_file = std::env::current_dir().unwrap();
+        for platform in [Platform::Netease, Platform::Tencent] {
+            app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
+                platform,
+                result: Err("刷新失败".to_owned()),
+            });
+        }
+        app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
+            platform: Platform::Netease,
+            result: Ok(LoginToken::Netease(NeteaseLoginToken::new(
+                "new",
+                "new",
+                "new",
+                Some(i64::MAX),
+            ))),
+        });
+        assert_eq!(app.login_state(Platform::Netease), "已登录");
+        let warnings = app.cookie_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("QQ音乐"));
+    }
+
+    #[test]
+    fn successful_login_clears_expiry_and_refresh_failure_warning() {
+        use netease_qq_music_api::models::{LoginToken, NeteaseLoginToken};
+        let mut app = cookie_test_app();
+        app.paths.cookie_file = std::env::current_dir().unwrap();
+        set_test_cookie(&mut app, 1);
+        app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
+            platform: Platform::Netease,
+            result: Err("刷新失败".to_owned()),
+        });
+        app.login_overlay = Some(LoginOverlay {
+            request_id: 1,
+            phase: LoginPhase::WaitingConfirm,
+            qr_lines: Vec::new(),
+            detail: String::new(),
+        });
+        app.handle_message(crate::app::AppMessage::LoginSuccess {
+            request_id: 1,
+            token: LoginToken::Netease(NeteaseLoginToken::new("new", "new", "new", Some(i64::MAX))),
+        });
+        assert!(app.cookie_warnings().is_empty());
+        assert_eq!(app.login_state(Platform::Netease), "已登录");
+    }
 
     #[test]
     fn compact_qr_keeps_its_first_and_last_rows_on_an_80_by_24_terminal() {

@@ -833,7 +833,9 @@ impl App {
                 let Some(overlay) = self.login_overlay.as_mut() else {
                     return;
                 };
-                if request_id != overlay.request_id {
+                if request_id != overlay.request_id
+                    || matches!(overlay.phase, LoginPhase::Failed | LoginPhase::Expired)
+                {
                     return;
                 }
                 match prepare_qr(&payload) {
@@ -845,6 +847,9 @@ impl App {
                     Err(error) => {
                         overlay.phase = LoginPhase::Failed;
                         overlay.detail = format!("二维码处理失败:{error}");
+                        if let Some(cancel) = self.login_cancel.take() {
+                            let _ = cancel.send(());
+                        }
                     }
                 }
             }
@@ -856,7 +861,9 @@ impl App {
                 let Some(overlay) = self.login_overlay.as_mut() else {
                     return;
                 };
-                if request_id != overlay.request_id {
+                if request_id != overlay.request_id
+                    || matches!(overlay.phase, LoginPhase::Failed | LoginPhase::Expired)
+                {
                     return;
                 }
                 overlay.phase = phase;
@@ -866,12 +873,10 @@ impl App {
                 }
             }
             AppMessage::LoginSuccess { request_id, token } => {
-                if self
-                    .login_overlay
-                    .as_ref()
-                    .map(|overlay| overlay.request_id)
-                    != Some(request_id)
-                {
+                if !self.login_overlay.as_ref().is_some_and(|overlay| {
+                    overlay.request_id == request_id
+                        && !matches!(overlay.phase, LoginPhase::Failed | LoginPhase::Expired)
+                }) {
                     return;
                 }
                 let logged_in_platform = match &token {
@@ -1140,6 +1145,60 @@ mod tests {
                 assert_eq!(app.notice.text, notice);
             }
         }
+    }
+
+    #[test]
+    fn invalid_qr_cancels_polling_and_keeps_failure_until_a_new_login() {
+        let mut app = test_app();
+        let (cancel_tx, mut cancel_rx) = oneshot::channel();
+        app.login_cancel = Some(cancel_tx);
+        app.login_overlay = Some(LoginOverlay {
+            request_id: 1,
+            phase: LoginPhase::Creating,
+            qr_lines: Vec::new(),
+            detail: String::new(),
+        });
+        app.handle_message(AppMessage::LoginQr {
+            request_id: 1,
+            payload: "data:image/png;base64,!!!!".into(),
+        });
+        assert_eq!(cancel_rx.try_recv(), Ok(()));
+        let failure = app.login_overlay.as_ref().unwrap().detail.clone();
+
+        // Messages already queued before cancellation must not revive the failed session.
+        for phase in [
+            LoginPhase::WaitingScan,
+            LoginPhase::WaitingConfirm,
+            LoginPhase::Expired,
+        ] {
+            app.handle_message(AppMessage::LoginPhase {
+                request_id: 1,
+                phase,
+                detail: "late polling response".into(),
+            });
+        }
+        app.handle_message(AppMessage::LoginSuccess {
+            request_id: 1,
+            token: token(Platform::Netease, "late"),
+        });
+        let overlay = app.login_overlay.as_ref().unwrap();
+        assert_eq!(overlay.phase, LoginPhase::Failed);
+        assert_eq!(overlay.detail, failure);
+        assert!(app.cookies.token_for(Platform::Netease).is_none());
+
+        app.login_overlay = Some(LoginOverlay {
+            request_id: 2,
+            phase: LoginPhase::Creating,
+            qr_lines: Vec::new(),
+            detail: String::new(),
+        });
+        app.handle_message(AppMessage::LoginQr {
+            request_id: 2,
+            payload: "https://example.com/login".into(),
+        });
+        let overlay = app.login_overlay.as_ref().unwrap();
+        assert_eq!(overlay.phase, LoginPhase::WaitingScan);
+        assert!(!overlay.qr_lines.is_empty());
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub enum AppMessage {
     },
     CookieRefreshFinished {
         platform: Platform,
+        cookie_revision: u64,
         result: Result<LoginToken, String>,
     },
     DownloadStage {
@@ -148,6 +149,7 @@ pub struct App {
     login_cancel: Option<oneshot::Sender<()>>,
     cookie_refresh_pending: usize,
     cookie_refresh_failed: Vec<Platform>,
+    cookie_revisions: [u64; 2],
 }
 
 impl App {
@@ -203,6 +205,7 @@ impl App {
             login_cancel: None,
             cookie_refresh_pending: 0,
             cookie_refresh_failed: Vec::new(),
+            cookie_revisions: [0; 2],
         }
     }
 
@@ -234,6 +237,7 @@ impl App {
             ),
         );
         for (platform, token) in candidates {
+            let cookie_revision = self.cookie_revisions[platform_index(platform)];
             let client = Arc::clone(&self.client);
             let tx = self.tx.clone();
             tokio::spawn(async move {
@@ -258,7 +262,11 @@ impl App {
                     }
                 }
                 .map_err(|error| error.to_string());
-                let _ = tx.send(AppMessage::CookieRefreshFinished { platform, result });
+                let _ = tx.send(AppMessage::CookieRefreshFinished {
+                    platform,
+                    cookie_revision,
+                    result,
+                });
             });
         }
     }
@@ -869,6 +877,7 @@ impl App {
                 };
                 // 登录成功后立即同步保存;后续请求均从该存储读取 Cookie.
                 let save_result = self.cookies.set_and_save(token, &self.paths.cookie_file);
+                self.cookie_revisions[platform_index(logged_in_platform)] += 1;
                 self.cookie_refresh_failed
                     .retain(|platform| *platform != logged_in_platform);
                 self.login_overlay = None;
@@ -887,10 +896,18 @@ impl App {
                     ),
                 }
             }
-            AppMessage::CookieRefreshFinished { platform, result } => {
+            AppMessage::CookieRefreshFinished {
+                platform,
+                cookie_revision,
+                result,
+            } => {
                 self.cookie_refresh_pending = self.cookie_refresh_pending.saturating_sub(1);
+                if cookie_revision != self.cookie_revisions[platform_index(platform)] {
+                    return;
+                }
                 match result {
                     Ok(token) => {
+                        self.cookie_revisions[platform_index(platform)] += 1;
                         self.cookie_refresh_failed
                             .retain(|failed| *failed != platform);
                         match self.cookies.set_and_save(token, &self.paths.cookie_file) {
@@ -987,6 +1004,13 @@ impl App {
     }
 }
 
+fn platform_index(platform: Platform) -> usize {
+    match platform {
+        Platform::Netease => 0,
+        Platform::Tencent => 1,
+    }
+}
+
 fn song_key(platform: Platform, id: &str) -> String {
     let prefix = match platform {
         Platform::Netease => 'N',
@@ -1035,4 +1059,99 @@ async fn resolve_url(
         None => request.send().await?,
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netease_qq_music_api::models::{NeteaseLoginToken, TencentLoginToken};
+
+    fn test_app() -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(
+            Arc::new(MusicClient::new()),
+            tx,
+            AppPaths {
+                cookie_file: "__dqn_app_test_cookie.json".into(),
+                download_dir: "test-downloads".into(),
+            },
+        );
+        // Exercise in-memory login even if saving fails, without creating a cookie file.
+        app.paths.cookie_file = std::env::current_dir().unwrap();
+        app
+    }
+
+    fn token(platform: Platform, key: &str) -> LoginToken {
+        match platform {
+            Platform::Netease => {
+                LoginToken::Netease(NeteaseLoginToken::new(key, key, key, Some(i64::MAX)))
+            }
+            Platform::Tencent => {
+                LoginToken::Tencent(TencentLoginToken::new(1, key, key, key, Some(i64::MAX), 1))
+            }
+        }
+    }
+
+    fn complete_login(app: &mut App, platform: Platform) {
+        app.login_overlay = Some(LoginOverlay {
+            request_id: 1,
+            phase: LoginPhase::WaitingConfirm,
+            qr_lines: Vec::new(),
+            detail: String::new(),
+        });
+        app.handle_message(AppMessage::LoginSuccess {
+            request_id: 1,
+            token: token(platform, "new"),
+        });
+    }
+
+    #[test]
+    fn stale_refresh_cannot_replace_new_login_or_raise_a_false_warning() {
+        for platform in [Platform::Netease, Platform::Tencent] {
+            for result in [Ok(token(platform, "old")), Err("old request failed".into())] {
+                let mut app = test_app();
+                app.cookies.set(token(platform, "old"));
+                app.cookie_refresh_pending = 1;
+                complete_login(&mut app, platform);
+                let new_cookie = app.cookies.cookie_header_for(platform);
+                let notice = app.notice.text.clone();
+
+                app.handle_message(AppMessage::CookieRefreshFinished {
+                    platform,
+                    cookie_revision: 0,
+                    result,
+                });
+
+                assert_eq!(app.cookies.cookie_header_for(platform), new_cookie);
+                assert_eq!(app.notice.text, notice);
+                assert!(app.cookie_warnings().is_empty());
+                assert_eq!(app.cookie_refresh_pending, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn login_on_one_platform_does_not_discard_other_platform_refresh() {
+        let mut app = test_app();
+        app.cookie_refresh_pending = 1;
+        complete_login(&mut app, Platform::Netease);
+        app.handle_message(AppMessage::CookieRefreshFinished {
+            platform: Platform::Tencent,
+            cookie_revision: 0,
+            result: Ok(token(Platform::Tencent, "refreshed")),
+        });
+        assert!(
+            app.cookies
+                .cookie_header_for(Platform::Netease)
+                .unwrap()
+                .contains("new")
+        );
+        assert!(
+            app.cookies
+                .cookie_header_for(Platform::Tencent)
+                .unwrap()
+                .contains("refreshed")
+        );
+        assert_eq!(app.cookie_refresh_pending, 0);
+    }
 }

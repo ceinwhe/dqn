@@ -555,6 +555,7 @@ mod tests {
         set_test_cookie(&mut app, i64::MAX);
         app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
             platform: Platform::Netease,
+            cookie_revision: 0,
             result: Err("连接超时".to_owned()),
         });
         app.set_notice(NoticeKind::Success, "下载完成");
@@ -595,11 +596,13 @@ mod tests {
         for platform in [Platform::Netease, Platform::Tencent] {
             app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
                 platform,
+                cookie_revision: 0,
                 result: Err("刷新失败".to_owned()),
             });
         }
         app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
             platform: Platform::Netease,
+            cookie_revision: 0,
             result: Ok(LoginToken::Netease(NeteaseLoginToken::new(
                 "new",
                 "new",
@@ -621,6 +624,7 @@ mod tests {
         set_test_cookie(&mut app, 1);
         app.handle_message(crate::app::AppMessage::CookieRefreshFinished {
             platform: Platform::Netease,
+            cookie_revision: 0,
             result: Err("刷新失败".to_owned()),
         });
         app.login_overlay = Some(LoginOverlay {

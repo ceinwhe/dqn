@@ -356,6 +356,9 @@ impl App {
     }
 
     pub fn toggle_platform(&mut self) {
+        // Invalidate the old platform even when an empty input prevents a new search.
+        self.search_request_id += 1;
+        self.loading = false;
         self.platform = match self.platform {
             Platform::Netease => Platform::Tencent,
             Platform::Tencent => Platform::Netease,
@@ -1103,6 +1106,40 @@ mod tests {
             request_id: 1,
             token: token(platform, "new"),
         });
+    }
+
+    #[test]
+    fn switching_platform_discards_in_flight_search_when_input_is_empty() {
+        for platform in [Platform::Netease, Platform::Tencent] {
+            for result in [
+                Ok(SearchSongResult {
+                    songs: Vec::new(),
+                    more: true,
+                }),
+                Err("old platform request failed".into()),
+            ] {
+                let mut app = test_app();
+                app.platform = platform;
+                app.query = "previous query".into();
+                app.input.clear();
+                app.search_request_id = 7;
+                app.loading = true;
+
+                app.toggle_platform();
+                let notice = app.notice.text.clone();
+                assert_ne!(app.platform, platform);
+                assert!(!app.loading);
+
+                app.handle_message(AppMessage::SearchFinished {
+                    request_id: 7,
+                    result,
+                });
+                assert!(app.results.is_empty());
+                assert!(!app.more);
+                assert!(!app.loading);
+                assert_eq!(app.notice.text, notice);
+            }
+        }
     }
 
     #[test]
